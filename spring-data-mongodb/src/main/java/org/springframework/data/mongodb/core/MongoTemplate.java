@@ -22,7 +22,6 @@ import lombok.AllArgsConstructor;
 import lombok.NonNull;
 import lombok.RequiredArgsConstructor;
 
-import java.beans.PropertyDescriptor;
 import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
@@ -52,6 +51,7 @@ import org.springframework.data.geo.Distance;
 import org.springframework.data.geo.GeoResult;
 import org.springframework.data.geo.GeoResults;
 import org.springframework.data.geo.Metric;
+import org.springframework.data.geo.Point;
 import org.springframework.data.mapping.PropertyPath;
 import org.springframework.data.mapping.PropertyReferenceException;
 import org.springframework.data.mapping.context.MappingContext;
@@ -68,7 +68,16 @@ import org.springframework.data.mongodb.core.aggregation.AggregationResults;
 import org.springframework.data.mongodb.core.aggregation.Fields;
 import org.springframework.data.mongodb.core.aggregation.TypeBasedAggregationOperationContext;
 import org.springframework.data.mongodb.core.aggregation.TypedAggregation;
-import org.springframework.data.mongodb.core.convert.*;
+import org.springframework.data.mongodb.core.convert.DbRefResolver;
+import org.springframework.data.mongodb.core.convert.DefaultDbRefResolver;
+import org.springframework.data.mongodb.core.convert.JsonSchemaMapper;
+import org.springframework.data.mongodb.core.convert.MappingMongoConverter;
+import org.springframework.data.mongodb.core.convert.MongoConverter;
+import org.springframework.data.mongodb.core.convert.MongoCustomConversions;
+import org.springframework.data.mongodb.core.convert.MongoJsonSchemaMapper;
+import org.springframework.data.mongodb.core.convert.MongoWriter;
+import org.springframework.data.mongodb.core.convert.QueryMapper;
+import org.springframework.data.mongodb.core.convert.UpdateMapper;
 import org.springframework.data.mongodb.core.index.IndexOperations;
 import org.springframework.data.mongodb.core.index.IndexOperationsProvider;
 import org.springframework.data.mongodb.core.index.MongoMappingEventPublisher;
@@ -93,9 +102,9 @@ import org.springframework.data.mongodb.core.query.Criteria;
 import org.springframework.data.mongodb.core.query.Meta;
 import org.springframework.data.mongodb.core.query.NearQuery;
 import org.springframework.data.mongodb.core.query.Query;
+import org.springframework.data.mongodb.core.query.QueryContext;
 import org.springframework.data.mongodb.core.query.Update;
 import org.springframework.data.mongodb.core.validation.Validator;
-import org.springframework.data.projection.ProjectionInformation;
 import org.springframework.data.projection.SpelAwareProxyProjectionFactory;
 import org.springframework.data.util.CloseableIterator;
 import org.springframework.data.util.Optionals;
@@ -3308,6 +3317,7 @@ public class MongoTemplate implements MongoOperations, ApplicationContextAware, 
 
 		private final MongoTemplate delegate;
 		private final ClientSession session;
+		private final QueryContext queryContext = new SessionQueryContext();
 
 		/**
 		 * @param session must not be {@literal null}.
@@ -3358,10 +3368,63 @@ public class MongoTemplate implements MongoOperations, ApplicationContextAware, 
 			CountOptions options = new CountOptions();
 			query.getCollation().map(Collation::toMongoCollation).ifPresent(options::collation);
 
-			Document document = delegate.queryMapper.getMappedObject(query.getQueryObject(),
+			Document document = delegate.queryMapper.getMappedObject(query.getQueryObject(queryContext),
 					Optional.ofNullable(entityClass).map(it -> delegate.mappingContext.getPersistentEntity(entityClass)));
 
 			return execute(collectionName, collection -> collection.countDocuments(document, options));
+		}
+
+		/**
+		 * @author Christoph Strobl
+		 * @since 2.1
+		 */
+		static class SessionQueryContext implements QueryContext {
+
+			@Override
+			public MongoCriteriaOperator getMongoOperator(RawCriteria criteria, String operator) {
+
+				if (operator.equals("$maxDistance") || operator.equals("$near") || operator.equals("$nearSphere")) {
+
+					String geoOperator = operator;
+					if (geoOperator.equals("$maxDistance")) {
+						geoOperator = criteria.contains("$near") ? "$near" : "$nearSphere";
+					}
+
+					return processNearQuery(criteria, geoOperator);
+				}
+
+				return QueryContext.super.getMongoOperator(criteria, operator);
+			}
+
+			private MongoCriteriaOperator processNearQuery(RawCriteria criteria, String geoOperator) {
+
+				criteria.markProcessed(geoOperator);
+
+				boolean spheric = geoOperator.equals("$nearSphere");
+				Number distance = Double.MAX_VALUE;
+
+				if (criteria.contains("$maxDistance")) {
+
+					criteria.markProcessed("$maxDistance");
+					distance = (Number) criteria.valueOf("$maxDistance");
+				}
+
+				List<Object> $center = Arrays.asList(toCenterCoordinates(criteria.valueOf(geoOperator)), distance);
+				return new MongoCriteriaOperator("$geoWithin", new Document(spheric ? "$centerSphere" : "$center", $center));
+			}
+
+			private Object toCenterCoordinates(Object value) {
+
+				if (ObjectUtils.isArray(value)) {
+					return value;
+				}
+
+				if (value instanceof Point) {
+					return Arrays.asList(((Point) value).getX(), ((Point) value).getY());
+				}
+
+				return value;
+			}
 		}
 	}
 }
